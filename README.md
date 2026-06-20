@@ -21,10 +21,12 @@ install.sh                          # end-to-end setup: clone repo, venv, deps, 
 app.py                               # Gradio web UI (not provided by the upstream repo)
 utils/wan_5b_wrapper.py              # patched copy of the upstream file (text encoder load fix)
 utils/inference_utils.py             # patched copy of the upstream file (generator checkpoint load fix)
+pipeline/causal_diffusion_inference.py # patched copy of the upstream file (image-conditioning batch-size bug fix)
 SESSION_NOTES.md                     # full narrative log of the session that built this: every
                                       # optimization tried (kept and discarded, with numbers), the
-                                      # 3 app.py tabs, and a known unfixed upstream bug - read this
-                                      # first if picking this repo back up cold on a new VPS
+                                      # 3 app.py tabs, and the upstream bugs found+fixed along the
+                                      # way - read this first if picking this repo back up cold on
+                                      # a new VPS
 scripts/
   benchmark_load.py                  # measures pipeline build + checkpoint load time
   benchmark_decode.py                # sweeps VAE decode_to_pixel_chunk chunk_size
@@ -54,13 +56,13 @@ scripts/
   sink migration, already enabled in `configs/inference.yaml`).
 - **Imagen + formato (beta)** — 16:9/9:16 aspect ratio switch (the model is
   officially trained on both orientations) and optional image-to-video
-  conditioning via `encode_to_latent`/`initial_latent`. **Known unfixed bug**:
-  reference-image conditioning combined with certain block counts (e.g. 7
-  blocks / 56 frames) throws `AssertionError: L1 (7040) must be divisible by
-  num_chunks (N)` from `pipeline/causal_diffusion_inference.py` — an upstream
-  bug where the image-injection code path passes the full unsliced
-  `conditional_dict` instead of `conditional_dict_list[block_index]`. Details
-  and the proposed one-line-per-call fix are in `SESSION_NOTES.md`.
+  conditioning via `encode_to_latent`/`initial_latent`. Required patching an
+  upstream bug in `pipeline/causal_diffusion_inference.py`'s image-injection
+  code path (it passed the full unsliced `conditional_dict` instead of
+  `conditional_dict_list[block_index]`, breaking cross-attention for block
+  counts that don't evenly divide the per-block token length, e.g. 7 blocks /
+  56 frames). Fixed and verified against that exact failing case - details in
+  `SESSION_NOTES.md`.
 
 ## Quick start
 
