@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 import uuid
@@ -14,10 +15,16 @@ from utils.inference_utils import (
     prepare_single_prompt_inputs,
     save_video,
 )
+from utils.lightvae_5b_wrapper import LightVAE5BWrapper
 
 MERGED_CHECKPOINT_PATH = "checkpoints/LongLive-2.0-5B/model_bf16.pt"
+LIGHTVAE_CHECKPOINT_PATH = "wan_models/Matrix-Game-3.0/MG-LightVAE_v2.pth"
 OUTPUT_DIR = "videos/gradio"
 DEVICE = torch.device("cuda")
+
+QUALITY = "Calidad (resolución completa, ~60s de decode)"
+FAST = "Rápido (resolución completa + VAE podado, ~8x más rápido en decode)"
+TURBO = "Turbo (media resolución + VAE podado, ~4x denoise y decode, menor nitidez)"
 
 torch.set_grad_enabled(False)
 
@@ -30,12 +37,28 @@ place_vae_for_streaming(pipe, _config)
 pipe.generator.model.eval().requires_grad_(False)
 print("Pipeline ready.")
 
+# Resolution is only fixed by `args.image_or_video_shape` at pipeline
+# construction time via `frame_seq_length` (math.prod(shape[-2:]) // 4); the
+# transformer itself derives its token grid from the actual input tensor at
+# call time, so switching resolution per request just means swapping these
+# two values back and forth before calling pipe.inference().
+FULL_SHAPE = list(_config.image_or_video_shape)
+HALF_SHAPE = FULL_SHAPE[:3] + [FULL_SHAPE[3] // 2, FULL_SHAPE[4] // 2]
+FULL_FRAME_SEQ_LEN = math.prod(FULL_SHAPE[-2:]) // 4
+HALF_FRAME_SEQ_LEN = math.prod(HALF_SHAPE[-2:]) // 4
+
+print("Loading mg_lightvae_v2 (fast decode mode)...")
+lightvae = LightVAE5BWrapper(
+    vae_path=LIGHTVAE_CHECKPOINT_PATH, device=DEVICE, dtype=torch.bfloat16
+).eval()
+print(f"mg_lightvae_v2 ready (pruning_rate={lightvae.pruning_rate}).")
+
 # Single GPU, single model instance: serialize concurrent Gradio requests.
 _generation_lock = threading.Lock()
 
 
 @torch.inference_mode()
-def generate(prompt, num_output_frames, sampling_steps, guidance_scale, seed):
+def generate(prompt, num_output_frames, sampling_steps, guidance_scale, seed, decode_mode):
     if not prompt or not prompt.strip():
         raise gr.Error("Please enter a prompt.")
     num_output_frames = int(num_output_frames)
@@ -43,6 +66,13 @@ def generate(prompt, num_output_frames, sampling_steps, guidance_scale, seed):
         num_output_frames = (num_output_frames // 8) * 8 or 8
 
     with _generation_lock:
+        if decode_mode == TURBO:
+            _config.image_or_video_shape = HALF_SHAPE
+            pipe.frame_seq_length = HALF_FRAME_SEQ_LEN
+        else:
+            _config.image_or_video_shape = FULL_SHAPE
+            pipe.frame_seq_length = FULL_FRAME_SEQ_LEN
+
         _config.num_output_frames = num_output_frames
         pipe.sampling_steps = int(sampling_steps)
         pipe.guidance_scale = float(guidance_scale)
@@ -66,9 +96,12 @@ def generate(prompt, num_output_frames, sampling_steps, guidance_scale, seed):
         torch.cuda.empty_cache()
 
         t0 = time.time()
-        video = pipe.vae.decode_to_pixel_chunk(latents, use_cache=False, chunk_size=16)
+        if decode_mode in (FAST, TURBO):
+            video = lightvae.decode_to_pixel(latents, use_cache=False)
+        else:
+            video = pipe.vae.decode_to_pixel_chunk(latents, use_cache=False, chunk_size=16)
         video = (video * 0.5 + 0.5).clamp(0, 1)
-        print(f"[generate] VAE decode done in {time.time() - t0:.1f}s")
+        print(f"[generate] VAE decode ({decode_mode}) done in {time.time() - t0:.1f}s")
 
         output_path = f"{OUTPUT_DIR}/{uuid.uuid4().hex}.mp4"
         save_video(video[0], output_path, fps=24)
@@ -97,13 +130,23 @@ with gr.Blocks(title="LongLive-2.0 (RunPod / BF16)") as demo:
                 label="Guidance scale", minimum=0.5, maximum=3.0, step=0.1, value=1.0
             )
             seed = gr.Number(label="Seed", value=0, precision=0)
+            decode_mode = gr.Radio(
+                label="Velocidad / calidad",
+                choices=[QUALITY, FAST, TURBO],
+                value=QUALITY,
+                info=(
+                    "Calidad: máxima nitidez, más lento. "
+                    "Rápido: mismo detalle de imagen, decode ~8x más rápido. "
+                    "Turbo: media resolución + decode rápido, ~4x más rápido en total, menor nitidez."
+                ),
+            )
             run_btn = gr.Button("Generate video", variant="primary")
         with gr.Column():
             output_video = gr.Video(label="Output")
 
     run_btn.click(
         fn=generate,
-        inputs=[prompt, num_output_frames, sampling_steps, guidance_scale, seed],
+        inputs=[prompt, num_output_frames, sampling_steps, guidance_scale, seed, decode_mode],
         outputs=output_video,
     )
 

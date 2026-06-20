@@ -48,6 +48,8 @@ hf download Efficient-Large-Model/LongLive-2.0-5B \
   --exclude "*.safetensors" --exclude "*fp4*"
 hf download Wan-AI/Wan2.2-TI2V-5B \
   --local-dir "$MODELS_DIR/wan_models/Wan2.2-TI2V-5B"
+hf download Skywork/Matrix-Game-3.0 MG-LightVAE_v2.pth \
+  --local-dir "$MODELS_DIR/wan_models/Matrix-Game-3.0"
 
 echo "==> Symlinking weights into the repo (keeps repo tree path-compatible)..."
 rm -rf "$REPO_DIR/checkpoints" "$REPO_DIR/wan_models"
@@ -57,6 +59,9 @@ ln -s "$MODELS_DIR/wan_models" "$REPO_DIR/wan_models"
 echo "==> Copying the Gradio web app into the repo..."
 cp "$(dirname "$0")/app.py" "$REPO_DIR/app.py"
 mkdir -p "$REPO_DIR/videos/gradio"
+
+echo "==> Applying the WanTextEncoder load-time fix (bf16 + mmap + meta device)..."
+cp "$(dirname "$0")/utils/wan_5b_wrapper.py" "$REPO_DIR/utils/wan_5b_wrapper.py"
 
 cat <<'EOF'
 
