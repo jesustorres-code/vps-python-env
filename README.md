@@ -21,20 +21,46 @@ install.sh                          # end-to-end setup: clone repo, venv, deps, 
 app.py                               # Gradio web UI (not provided by the upstream repo)
 utils/wan_5b_wrapper.py              # patched copy of the upstream file (text encoder load fix)
 utils/inference_utils.py             # patched copy of the upstream file (generator checkpoint load fix)
+SESSION_NOTES.md                     # full narrative log of the session that built this: every
+                                      # optimization tried (kept and discarded, with numbers), the
+                                      # 3 app.py tabs, and a known unfixed upstream bug - read this
+                                      # first if picking this repo back up cold on a new VPS
 scripts/
   benchmark_load.py                  # measures pipeline build + checkpoint load time
   benchmark_decode.py                # sweeps VAE decode_to_pixel_chunk chunk_size
   benchmark_compile.py               # evaluates torch.compile (dynamic=False) on the generator
   benchmark_compile_dynamic.py       # evaluates torch.compile (dynamic=True) on the generator
   benchmark_lightvae.py              # standard Wan2.2 VAE vs mg_lightvae_v2 decode, same latents
+  benchmark_lightvae_v1_vs_v2.py     # mg_lightvae v1 (pruning 0.5) vs v2 (pruning 0.75) quality+speed
   benchmark_resolution.py            # half-resolution denoise+decode speedup/safety check
   benchmark_build_breakdown.py       # times each CausalDiffusionInferencePipeline.__init__ sub-step
   benchmark_textencoder_breakdown.py # times WanTextEncoder's construction/load/cuda sub-steps
   benchmark_textencoder_meta.py      # validates the device='meta'+assign=True fix in isolation
   benchmark_generator_checkpoint_load.py # validates mmap+assign on the generator checkpoint load
+  benchmark_cudnn_flags.py           # evaluates cudnn.benchmark+TF32 (discarded, autotune cost > gain)
+  benchmark_channels_last.py         # evaluates channels_last_3d on the standard VAE (discarded, slower)
+  diagnose_vae_encode_temporal.py    # empirically derives the VAE's pixel->latent temporal compression ratio
   quickstart_test.py                 # minimal end-to-end smoke test (build->denoise->decode->save)
   setup_path.sh                      # generic ~/.local/bin PATH setup (unrelated utility)
 ```
+
+## Gradio UI tabs
+
+`app.py` exposes three tabs (see `SESSION_NOTES.md` for the full mechanism behind each):
+
+- **Generación simple** — the original single-prompt text-to-video tab.
+- **Multi-escena (beta)** — one prompt per scene in a single video, built on the
+  pipeline's native per-block prompting + `multi_shot_sink` (scene-cut attention
+  sink migration, already enabled in `configs/inference.yaml`).
+- **Imagen + formato (beta)** — 16:9/9:16 aspect ratio switch (the model is
+  officially trained on both orientations) and optional image-to-video
+  conditioning via `encode_to_latent`/`initial_latent`. **Known unfixed bug**:
+  reference-image conditioning combined with certain block counts (e.g. 7
+  blocks / 56 frames) throws `AssertionError: L1 (7040) must be divisible by
+  num_chunks (N)` from `pipeline/causal_diffusion_inference.py` — an upstream
+  bug where the image-injection code path passes the full unsliced
+  `conditional_dict` instead of `conditional_dict_list[block_index]`. Details
+  and the proposed one-line-per-call fix are in `SESSION_NOTES.md`.
 
 ## Quick start
 

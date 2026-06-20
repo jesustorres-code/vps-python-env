@@ -296,6 +296,38 @@ def prepare_single_prompt_inputs(
     return noise, prompts
 
 
+def prepare_multi_scene_inputs(
+    config,
+    block_prompts: list[str],
+    device: torch.device | str,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    batch_size: int = 1,
+    generator: torch.Generator | None = None,
+):
+    """Create latent noise for an already-expanded one-prompt-per-block list.
+
+    Unlike prepare_single_prompt_inputs, the caller has already built the
+    per-block prompt list (including any scene-cut prefix), so this just
+    sizes the noise tensor from len(block_prompts) instead of repeating a
+    single prompt.
+    """
+    latent_shape = list(config.image_or_video_shape[2:])
+    if len(latent_shape) != 3:
+        raise ValueError(f"Expected latent shape [C, H, W], got {latent_shape}")
+
+    frames_per_block = int(getattr(config, "num_frame_per_block", 1))
+    num_frames = len(block_prompts) * frames_per_block
+    prompts = [block_prompts for _ in range(batch_size)]
+    noise = torch.randn(
+        [batch_size, num_frames, *latent_shape],
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    return noise, prompts
+
+
 def video_to_uint8(video: torch.Tensor) -> torch.Tensor:
     """Convert a generated video tensor from [T, C, H, W] or [1, T, C, H, W] to uint8 THWC."""
     if video.ndim == 5:
