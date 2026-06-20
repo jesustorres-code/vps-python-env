@@ -65,14 +65,29 @@ Dos features:
 
 Probado con éxito de punta a punta, incluyendo el caso que antes disparaba el bug #4: imagen de referencia real (frame extraído de un video ya generado) → primer frame del resultado idéntico a la referencia, frames posteriores muestran movimiento coherente con el prompt.
 
+### Multi-escena: switch de formato + 3 bugs reales encontrados con una prueba de carga real
+
+Al probar la pestaña con un prompt de uso real (8 escenas narradas, ~35s) en vez de los ejemplos cortos anteriores, aparecieron 3 bugs que no se habían visto:
+
+1. **Fuga de memoria en fallos parciales**: si `pipe.inference()` fallaba a la mitad (ej. un error transitorio de CUDA `cusolver` al pedir demasiados bloques), el código nunca llegaba a las líneas que liberan el KV-cache — se quedaban ~25GB+ "atascados" e inutilizaban el servidor para cualquier request futuro hasta reiniciarlo a mano. **Fix**: la llamada a `pipe.inference()` en las 3 funciones de generación está envuelta en `try/finally`, así el cache se libera siempre, exitoso o no. También se agregó un `empty_cache()` extra después del decode (antes solo se liberaba antes del decode).
+2. **Parsing roto con texto pegado**: si el usuario pegaba una descripción larga que el editor envolvía en varios renglones físicos, `_parse_scenes` interpretaba cada renglón de continuación (sin `'::'`) como una escena nueva mal formada y tronaba. **Fix**: una línea sin `'::'` ahora se trata como continuación del prompt de la escena anterior (se concatena con espacio) en vez de error.
+3. **Los "segundos" no eran segundos reales** (el bug más importante): `_parse_scenes` convertía segundos→frames latentes 1:1, pero ambos decodificadores VAE EXPANDEN los frames latentes al decodificar a píxeles — un prompt de 8 escenas pensado para ~35s salía con ~140s reales. Fórmulas exactas confirmadas empíricamente (`diagnose_decode_temporal.py`, decodificando latentes sintéticos directamente, sin correr el pipeline completo):
+   - **LightVAE** (Rápido/Turbo): `pixel_T = 4·latent_T − 3` (exacto, sin excepciones).
+   - **VAE estándar** (Calidad, `decode_to_pixel_chunk` con `chunk_size=16`): cada fragmento independiente de 16 frames latentes aporta 61 frames de píxel; como `latent_T` siempre es múltiplo de `FRAMES_PER_BLOCK=8`, el único remanente posible es un fragmento de 8 frames, que aporta 29.
+   `_latent_frames_for_seconds(seconds, decode_mode)` invierte la fórmula correcta según el modo (búsqueda local alrededor de una estimación lineal) — verificado: 35s pedidos → 35.875s reales (antes ~140s).
+
+También se agregó el switch de formato (16:9/9:16) a esta pestaña, reusando `_shape_for` de la pestaña de imagen.
+
 ## Archivos nuevos/modificados esta sesión
 
-- `app.py` — 3 pestañas, funciones `generate_multiscene`, `generate_image_conditioned`, `_parse_scenes`, `_build_block_prompts`, `_shape_for`, `_encode_reference_image`.
+- `app.py` — 3 pestañas, funciones `generate_multiscene`, `generate_image_conditioned`, `_parse_scenes`, `_build_block_prompts`, `_shape_for`, `_encode_reference_image`, `_pixel_frames_for_latent`, `_latent_frames_for_seconds`.
 - `utils/inference_utils.py` — `prepare_multi_scene_inputs` (nueva), fixes de carga (`_torch_load`, `load_generator_checkpoint` con mmap+assign).
 - `utils/wan_5b_wrapper.py` — `WanTextEncoder` construido en `device='meta'`.
-- `benchmark_*.py`, `diagnose_vae_encode_temporal.py` — scripts de diagnóstico de esta sesión, no productivos pero útiles para no repetir investigación.
+- `pipeline/causal_diffusion_inference.py` — fix del bug #4 de image-conditioning (ver arriba).
+- `benchmark_*.py`, `diagnose_vae_encode_temporal.py`, `diagnose_decode_temporal.py` — scripts de diagnóstico de esta sesión, no productivos pero útiles para no repetir investigación.
 
 ## Pendiente / próximos pasos sugeridos
 
 1. Probar la combinación 9:16 + imagen de referencia + modo Rápido/Turbo (LightVAE) — no probada todavía.
 2. Si se quiere revisitar cuantización INT8 en el futuro, primero evaluar si vale la pena subir `torch` a >=2.11 para que `torchao` cargue sus kernels compilados (no intentado en esta sesión, riesgo de romper el setup actual).
+3. El límite real de tamaño en modo Calidad/Rápido (resolución completa) sigue sin acotarse con precisión — se confirmó que 70 bloques (560 frames) tumba el proceso completo en decode (modo Calidad) y que 105 bloques (840 frames) falla en denoise incluso con LightVAE (modo Rápido) por falta de memoria a resolución completa. Solo el modo Turbo (media resolución) demostró soportar 105 bloques de punta a punta.

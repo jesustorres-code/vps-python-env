@@ -92,18 +92,21 @@ def generate(prompt, num_output_frames, sampling_steps, guidance_scale, seed, de
             _config, prompt.strip(), DEVICE, generator=generator
         )
 
-        t0 = time.time()
-        latents = pipe.inference(noise=noise, text_prompts=prompts, return_latents=True)
-        print(f"[generate] denoising done in {time.time() - t0:.1f}s")
-
-        # Free the transformer's KV/cross-attn caches before VAE decode: the
-        # standard "wan" VAE has no chunked/cached decode mode of its own, so
-        # without this a full-length decode OOMs on a single 49GB GPU.
-        pipe.kv_cache_pos = None
-        pipe.kv_cache_neg = None
-        pipe.crossattn_cache_pos = None
-        pipe.crossattn_cache_neg = None
-        torch.cuda.empty_cache()
+        try:
+            t0 = time.time()
+            latents = pipe.inference(noise=noise, text_prompts=prompts, return_latents=True)
+            print(f"[generate] denoising done in {time.time() - t0:.1f}s")
+        finally:
+            # Free the transformer's KV/cross-attn caches before VAE decode (the
+            # standard "wan" VAE has no chunked/cached decode mode of its own, so
+            # without this a full-length decode OOMs on a single 49GB GPU) - in a
+            # `finally` so a failed/partial inference (e.g. an OOM or a transient
+            # CUDA error) doesn't leak the cache and starve every later request.
+            pipe.kv_cache_pos = None
+            pipe.kv_cache_neg = None
+            pipe.crossattn_cache_pos = None
+            pipe.crossattn_cache_neg = None
+            torch.cuda.empty_cache()
 
         t0 = time.time()
         if decode_mode in (FAST, TURBO):
@@ -112,21 +115,35 @@ def generate(prompt, num_output_frames, sampling_steps, guidance_scale, seed, de
             video = pipe.vae.decode_to_pixel_chunk(latents, use_cache=False, chunk_size=16)
         video = (video * 0.5 + 0.5).clamp(0, 1)
         print(f"[generate] VAE decode ({decode_mode}) done in {time.time() - t0:.1f}s")
+        del latents
+        torch.cuda.empty_cache()
 
         output_path = f"{OUTPUT_DIR}/{uuid.uuid4().hex}.mp4"
         save_video(video[0], output_path, fps=FPS)
         return output_path
 
 
-def _parse_scenes(raw_text: str) -> list[tuple[str, int]]:
-    """Parse 'segundos :: prompt' lines into (prompt, frames) tuples."""
-    scenes = []
+def _parse_scenes(raw_text: str) -> list[tuple[str, float]]:
+    """Parse 'segundos :: prompt' lines into (prompt, seconds) tuples.
+
+    Pasted descriptions often hard-wrap across several physical lines, so a
+    line without '::' is treated as a continuation of the previous scene's
+    prompt (appended with a space) rather than a new, malformed scene.
+
+    Returns desired real-world output seconds per scene, NOT latent frames -
+    converting seconds to latent frames requires knowing the decode_mode
+    (see _latent_frames_for_seconds), which isn't known at parse time.
+    """
+    raw_scenes: list[list] = []  # [seconds, [prompt_line, ...]]
     for line_no, line in enumerate(raw_text.splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
         if "::" not in line:
-            raise gr.Error(f"Línea {line_no}: falta '::' para separar duración y prompt.")
+            if not raw_scenes:
+                raise gr.Error(f"Línea {line_no}: falta '::' para separar duración y prompt.")
+            raw_scenes[-1][1].append(line)
+            continue
         duration_str, prompt_text = line.split("::", 1)
         try:
             seconds = float(duration_str.strip())
@@ -137,11 +154,43 @@ def _parse_scenes(raw_text: str) -> list[tuple[str, int]]:
         prompt_text = prompt_text.strip()
         if not prompt_text:
             raise gr.Error(f"Línea {line_no}: falta el texto del prompt.")
-        frames = max(FRAMES_PER_BLOCK, round(seconds * FPS / FRAMES_PER_BLOCK) * FRAMES_PER_BLOCK)
-        scenes.append((prompt_text, frames))
-    if not scenes:
+        raw_scenes.append([seconds, [prompt_text]])
+    if not raw_scenes:
         raise gr.Error("Agrega al menos una escena (formato: 'segundos :: prompt').")
-    return scenes
+    return [(" ".join(prompt_lines), seconds) for seconds, prompt_lines in raw_scenes]
+
+
+# Both VAE decoders expand latent frames into more pixel frames on decode -
+# empirically confirmed exact formulas (see diagnose_decode_temporal.py):
+#   - LightVAE (FAST/TURBO, single continuous causal decode):
+#       pixel_T = 4 * latent_T - 3
+#   - Standard VAE (QUALITY, decode_to_pixel_chunk with chunk_size=16):
+#       each independent 16-latent-frame chunk contributes 61 pixel frames;
+#       since latent_T here is always a multiple of FRAMES_PER_BLOCK (8), the
+#       only possible remainder chunk is 8 frames, contributing 29 (4*8-3).
+def _pixel_frames_for_latent(latent_frames: int, decode_mode: str) -> int:
+    if decode_mode in (FAST, TURBO):
+        return 4 * latent_frames - 3
+    full_chunks, remainder = divmod(latent_frames, 16)
+    return full_chunks * 61 + (29 if remainder else 0)
+
+
+def _latent_frames_for_seconds(seconds: float, decode_mode: str) -> int:
+    """Inverse of _pixel_frames_for_latent: latent frame count (multiple of
+    FRAMES_PER_BLOCK) whose real decoded output duration is closest to
+    `seconds`, found by local search around a linear estimate."""
+    target_pixels = seconds * FPS
+    if decode_mode in (FAST, TURBO):
+        estimate_n = round((target_pixels + 3) / 4 / FRAMES_PER_BLOCK)
+    else:
+        estimate_n = round(target_pixels / 30.5)
+    best_n, best_error = None, None
+    for n in range(max(1, estimate_n - 3), estimate_n + 4):
+        latent_frames = n * FRAMES_PER_BLOCK
+        error = abs(_pixel_frames_for_latent(latent_frames, decode_mode) - target_pixels)
+        if best_error is None or error < best_error:
+            best_n, best_error = n, error
+    return best_n * FRAMES_PER_BLOCK
 
 
 def _build_block_prompts(scenes: list[tuple[str, int]]) -> list[str]:
@@ -158,23 +207,26 @@ def _build_block_prompts(scenes: list[tuple[str, int]]) -> list[str]:
 
 
 @torch.inference_mode()
-def generate_multiscene(scenes_text, sampling_steps, guidance_scale, seed, decode_mode):
-    scenes = _parse_scenes(scenes_text)
+def generate_multiscene(scenes_text, aspect_ratio, sampling_steps, guidance_scale, seed, decode_mode):
+    raw_scenes = _parse_scenes(scenes_text)
+    scenes = [
+        (text, _latent_frames_for_seconds(seconds, decode_mode)) for text, seconds in raw_scenes
+    ]
     block_prompts = _build_block_prompts(scenes)
     total_frames = sum(f for _, f in scenes)
+    expected_output_seconds = _pixel_frames_for_latent(total_frames, decode_mode) / FPS
     cut_blocks = [i for i, p in enumerate(block_prompts) if p.startswith(SCENE_CUT_PREFIX)]
     print(
-        f"[generate_multiscene] {len(scenes)} escena(s), {len(block_prompts)} bloques "
-        f"({total_frames} frames), cortes de escena en bloques: {cut_blocks}"
+        f"[generate_multiscene] aspect={aspect_ratio} {len(scenes)} escena(s), "
+        f"{len(block_prompts)} bloques ({total_frames} frames latentes, "
+        f"~{expected_output_seconds:.1f}s de salida real), "
+        f"cortes de escena en bloques: {cut_blocks}"
     )
 
     with _generation_lock:
-        if decode_mode == TURBO:
-            _config.image_or_video_shape = HALF_SHAPE
-            pipe.frame_seq_length = HALF_FRAME_SEQ_LEN
-        else:
-            _config.image_or_video_shape = FULL_SHAPE
-            pipe.frame_seq_length = FULL_FRAME_SEQ_LEN
+        shape, frame_seq_len = _shape_for(aspect_ratio, decode_mode)
+        _config.image_or_video_shape = shape
+        pipe.frame_seq_length = frame_seq_len
 
         _config.num_output_frames = total_frames
         pipe.sampling_steps = int(sampling_steps)
@@ -185,15 +237,16 @@ def generate_multiscene(scenes_text, sampling_steps, guidance_scale, seed, decod
             _config, block_prompts, DEVICE, generator=generator
         )
 
-        t0 = time.time()
-        latents = pipe.inference(noise=noise, text_prompts=prompts, return_latents=True)
-        print(f"[generate_multiscene] denoising done in {time.time() - t0:.1f}s")
-
-        pipe.kv_cache_pos = None
-        pipe.kv_cache_neg = None
-        pipe.crossattn_cache_pos = None
-        pipe.crossattn_cache_neg = None
-        torch.cuda.empty_cache()
+        try:
+            t0 = time.time()
+            latents = pipe.inference(noise=noise, text_prompts=prompts, return_latents=True)
+            print(f"[generate_multiscene] denoising done in {time.time() - t0:.1f}s")
+        finally:
+            pipe.kv_cache_pos = None
+            pipe.kv_cache_neg = None
+            pipe.crossattn_cache_pos = None
+            pipe.crossattn_cache_neg = None
+            torch.cuda.empty_cache()
 
         t0 = time.time()
         if decode_mode in (FAST, TURBO):
@@ -202,6 +255,8 @@ def generate_multiscene(scenes_text, sampling_steps, guidance_scale, seed, decod
             video = pipe.vae.decode_to_pixel_chunk(latents, use_cache=False, chunk_size=16)
         video = (video * 0.5 + 0.5).clamp(0, 1)
         print(f"[generate_multiscene] VAE decode ({decode_mode}) done in {time.time() - t0:.1f}s")
+        del latents
+        torch.cuda.empty_cache()
 
         output_path = f"{OUTPUT_DIR}/{uuid.uuid4().hex}.mp4"
         save_video(video[0], output_path, fps=FPS)
@@ -271,17 +326,18 @@ def generate_image_conditioned(
             _config, prompt.strip(), DEVICE, generator=generator
         )
 
-        t0 = time.time()
-        latents = pipe.inference(
-            noise=noise, text_prompts=prompts, initial_latent=initial_latent, return_latents=True
-        )
-        print(f"[generate_image_conditioned] denoising done in {time.time() - t0:.1f}s")
-
-        pipe.kv_cache_pos = None
-        pipe.kv_cache_neg = None
-        pipe.crossattn_cache_pos = None
-        pipe.crossattn_cache_neg = None
-        torch.cuda.empty_cache()
+        try:
+            t0 = time.time()
+            latents = pipe.inference(
+                noise=noise, text_prompts=prompts, initial_latent=initial_latent, return_latents=True
+            )
+            print(f"[generate_image_conditioned] denoising done in {time.time() - t0:.1f}s")
+        finally:
+            pipe.kv_cache_pos = None
+            pipe.kv_cache_neg = None
+            pipe.crossattn_cache_pos = None
+            pipe.crossattn_cache_neg = None
+            torch.cuda.empty_cache()
 
         t0 = time.time()
         if decode_mode in (FAST, TURBO):
@@ -290,6 +346,8 @@ def generate_image_conditioned(
             video = pipe.vae.decode_to_pixel_chunk(latents, use_cache=False, chunk_size=16)
         video = (video * 0.5 + 0.5).clamp(0, 1)
         print(f"[generate_image_conditioned] VAE decode ({decode_mode}) done in {time.time() - t0:.1f}s")
+        del latents
+        torch.cuda.empty_cache()
 
         output_path = f"{OUTPUT_DIR}/{uuid.uuid4().hex}.mp4"
         save_video(video[0], output_path, fps=FPS)
@@ -348,10 +406,19 @@ with gr.Blocks(title="LongLive-2.0 (RunPod / BF16)") as demo:
                         value="4 :: A compact silver robot walks through a clean robotics lab.",
                         lines=6,
                         info=(
-                            "Una escena por línea: 'segundos :: prompt'. "
+                            "Una escena por línea: 'segundos :: prompt' - son segundos REALES "
+                            "del video final (ya corregido para que coincidan, antes no). "
                             "La transición entre escenas se maneja automáticamente "
-                            "(no hace falta escribir nada especial)."
+                            "(no hace falta escribir nada especial). Si pegas texto largo "
+                            "y se envuelve en varios renglones, no pasa nada: los renglones "
+                            "sin '::' se pegan al prompt de la escena anterior."
                         ),
+                    )
+                    ms_aspect_ratio = gr.Radio(
+                        label="Formato",
+                        choices=[LANDSCAPE, PORTRAIT],
+                        value=LANDSCAPE,
+                        info="16:9 es el formato normal con el que hemos estado trabajando.",
                     )
                     ms_sampling_steps = gr.Slider(
                         label="Sampling steps", minimum=1, maximum=8, step=1, value=4
@@ -371,7 +438,10 @@ with gr.Blocks(title="LongLive-2.0 (RunPod / BF16)") as demo:
 
             ms_run_btn.click(
                 fn=generate_multiscene,
-                inputs=[scenes_input, ms_sampling_steps, ms_guidance_scale, ms_seed, ms_decode_mode],
+                inputs=[
+                    scenes_input, ms_aspect_ratio, ms_sampling_steps,
+                    ms_guidance_scale, ms_seed, ms_decode_mode,
+                ],
                 outputs=ms_output_video,
             )
 

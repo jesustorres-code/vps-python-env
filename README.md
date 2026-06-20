@@ -53,7 +53,15 @@ scripts/
 - **Generación simple** — the original single-prompt text-to-video tab.
 - **Multi-escena (beta)** — one prompt per scene in a single video, built on the
   pipeline's native per-block prompting + `multi_shot_sink` (scene-cut attention
-  sink migration, already enabled in `configs/inference.yaml`).
+  sink migration, already enabled in `configs/inference.yaml`), plus a 16:9/9:16
+  aspect ratio switch. A real-world 8-scene stress test surfaced 3 bugs, all
+  fixed: a GPU memory leak on partial inference failure (missing
+  `try/finally` around the KV-cache cleanup), pasted long descriptions that
+  hard-wrap across lines breaking the `'::'` parser, and - the important one -
+  typed scene durations not matching real output duration, since both VAE
+  decoders expand latent frames into more pixel frames on decode (exact
+  formulas confirmed empirically, see `SESSION_NOTES.md` and
+  `scripts/diagnose_decode_temporal.py`).
 - **Imagen + formato (beta)** — 16:9/9:16 aspect ratio switch (the model is
   officially trained on both orientations) and optional image-to-video
   conditioning via `encode_to_latent`/`initial_latent`. Required patching an
