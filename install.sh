@@ -63,6 +63,9 @@ mkdir -p "$REPO_DIR/videos/gradio"
 echo "==> Applying the WanTextEncoder load-time fix (bf16 + mmap + meta device)..."
 cp "$(dirname "$0")/utils/wan_5b_wrapper.py" "$REPO_DIR/utils/wan_5b_wrapper.py"
 
+echo "==> Applying the generator checkpoint load-time fix (mmap + assign)..."
+cp "$(dirname "$0")/utils/inference_utils.py" "$REPO_DIR/utils/inference_utils.py"
+
 cat <<'EOF'
 
 ==> Done. To launch the server:

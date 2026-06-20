@@ -19,7 +19,8 @@ you can instead follow the NVFP4 instructions in the upstream
 ```
 install.sh                          # end-to-end setup: clone repo, venv, deps, weights, app.py, fix
 app.py                               # Gradio web UI (not provided by the upstream repo)
-utils/wan_5b_wrapper.py              # patched copy of the upstream file (load-time fix, see below)
+utils/wan_5b_wrapper.py              # patched copy of the upstream file (text encoder load fix)
+utils/inference_utils.py             # patched copy of the upstream file (generator checkpoint load fix)
 scripts/
   benchmark_load.py                  # measures pipeline build + checkpoint load time
   benchmark_decode.py                # sweeps VAE decode_to_pixel_chunk chunk_size
@@ -30,6 +31,7 @@ scripts/
   benchmark_build_breakdown.py       # times each CausalDiffusionInferencePipeline.__init__ sub-step
   benchmark_textencoder_breakdown.py # times WanTextEncoder's construction/load/cuda sub-steps
   benchmark_textencoder_meta.py      # validates the device='meta'+assign=True fix in isolation
+  benchmark_generator_checkpoint_load.py # validates mmap+assign on the generator checkpoint load
   quickstart_test.py                 # minimal end-to-end smoke test (build->denoise->decode->save)
   setup_path.sh                      # generic ~/.local/bin PATH setup (unrelated utility)
 ```
@@ -137,16 +139,37 @@ These came out of benchmarking load and inference time on this pod;
   `nn.Embedding` per block, not a precomputed buffer), so nothing is left
   uninitialized.
   **Net effect: "pipeline build" 74.3s -> 5.6s, total load 109.1s -> 42.9s.**
+- **Fix 4: the same mmap+assign pattern, one step further down the load
+  path.** `CausalWanModel.from_pretrained()` (used to build the generator)
+  already does meta-device+assign internally via diffusers'
+  `low_cpu_mem_usage` path — that's why it measured at only 0.6s in fix 3's
+  breakdown. But `load_generator_checkpoint()`
+  (`utils/inference_utils.py`) was then overwriting those placeholder
+  weights with a plain `strict` `load_state_dict` (`copy_` semantics),
+  forcing the `from_pretrained` placeholder's mmap'd fp32 data to
+  materialize just to immediately discard it. Same fix, same file pattern:
+  `mmap=True` on the `torch.load()` of the checkpoint `.pt` file
+  (`model_bf16.pt`, 9.4GB) in `_torch_load()`, plus `assign=True` on
+  `generator.load_state_dict(...)`. Validated in isolation first
+  (`benchmark_generator_checkpoint_load.py`): `torch.load` without mmap
+  5.5s -> mmap=True 0.0s; `load_state_dict` with `copy_` 12.5s ->
+  `assign=True` 0.0s.
+  **Net effect: "Checkpoint loaded" 23.7s -> 0.1s, total load 42.9s -> 12.3s.**
 
-| Stage           | Baseline | +bf16  | +mmap  | +meta+assign |
-|-----------------|---------:|-------:|-------:|-------------:|
-| Pipeline built  |   74.3s  |  70.7s |  66.0s |        5.6s  |
-| Checkpoint load |   21.7s  |  17.5s |  23.5s |       23.7s* |
-| **Total**       | **109.1s**| **101.2s** | **101.7s** | **42.9s** |
+| Stage           | Baseline | +bf16  | +mmap  | +meta+assign | +generator mmap+assign |
+|-----------------|---------:|-------:|-------:|-------------:|------------------------:|
+| Pipeline built  |   74.3s  |  70.7s |  66.0s |        5.6s  |                   7.2s* |
+| Checkpoint load |   21.7s  |  17.5s |  23.5s |       23.7s* |                   0.1s  |
+| **Total**       | **109.1s**| **101.2s** | **101.7s** | **42.9s** | **12.3s** |
 
-\* checkpoint-load timing has run-to-run noise of a few seconds (page
-cache state); the pipeline-build numbers are the stable, reproducible
-signal.
+\* run-to-run noise of a few seconds (page cache state) on checkpoint-load
+timings prior to fix 4, and on pipeline-build after it; the headline
+numbers (74.3s -> 5.6s, 23.7s -> 0.1s) are the stable, reproducible signal.
+
+**Combined result: 109.1s -> 12.3s, a ~89% reduction in total load time**,
+with no quality regression (verified via a live generation after each
+fix) and no behavior change at inference time — every fix here only
+changes *how* the same final bf16 weights get into GPU memory.
 
 ### Inference: VAE backend + resolution switch
 
